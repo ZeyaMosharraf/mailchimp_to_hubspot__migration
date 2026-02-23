@@ -1,0 +1,2 @@
+from .mailchimp_columns import mailchimp_properties
+from .hubspot_columns import hubspot_properties
