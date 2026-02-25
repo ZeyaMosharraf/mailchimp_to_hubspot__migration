@@ -1,9 +1,10 @@
 import requests
-import json
-import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from config.settings import load_settings
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 _session = None
 
@@ -51,6 +52,7 @@ def batch_upsert_items(object_type: str, items: list[dict], id_property: str):
         unique_value = props.get(id_property)
 
         if not unique_value:
+            logger.warning(f"Skipping item — missing value for '{id_property}': {props}")
             continue
 
         prepared_inputs.append({
@@ -58,6 +60,10 @@ def batch_upsert_items(object_type: str, items: list[dict], id_property: str):
             "idProperty": id_property,
             "properties": props
         })
+
+    if not prepared_inputs:
+        logger.warning("No valid items in this batch — skipping API call.")
+        return {"results": [], "errors": []}
 
     payload = {
         "inputs": prepared_inputs
@@ -77,7 +83,8 @@ def batch_upsert_items(object_type: str, items: list[dict], id_property: str):
     
     response_json = response.json()
     if response.status_code == 207 and "errors" in response_json:
-        print(f"⚠️ WARNING: Partial Batch Failure. {len(response_json['errors'])} items failed.")
-        print(f"Error Details: {response_json['errors']}")
+        logger.warning(f"Partial batch failure — {len(response_json['errors'])} item(s) failed:")
+        for err in response_json["errors"]:
+            logger.warning(f"  → {err.get('message')} | context: {err.get('context')}")
     return response_json
 
