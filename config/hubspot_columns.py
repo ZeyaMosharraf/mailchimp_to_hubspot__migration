@@ -1,6 +1,8 @@
 hubspot_properties = [
+        "Name",
         "firstname",
         "lastname",
         "tags",
-        "email"
+        "email",
+        "phonenumber"
 ]
