@@ -3,6 +3,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from config.settings import load_settings
 from config.mailchimp_columns import mailchimp_properties
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 _session = None
@@ -55,7 +58,10 @@ def fetch_object(list_id: str, fields: list[str], offset: int, limit: int):
         timeout=30
     )
 
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"Mailchimp Fetch Error [list={list_id}, offset={offset}]: {e}. Details: {response.text}")
 
     data = response.json()
 
