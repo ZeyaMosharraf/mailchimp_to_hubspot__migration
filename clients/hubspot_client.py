@@ -1,54 +1,83 @@
 import requests
 import json
 import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config.settings import load_settings
-from config.monday_columns import monday_company_columns
 
-def upsert_item(board_id: str, unique_column_id: str, column_mapping: dict, item_data: dict):
+_session = None
+
+def get_hubspot_session() -> requests.Session:
+
+    global _session
+
+    if _session is None:
+        _session = requests.Session()
+
+        retry_strategy = Retry(
+            total=5,  
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST", "PATCH"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+
+        _session.mount("https://", adapter)
+        _session.mount("http://", adapter)
+
+    return _session
+
+def batch_upsert_items(object_type: str, items: list[dict], id_property: str):
+
     settings = load_settings()
-
-    token = settings.get("MONDAY_API_TOKEN")
-    board_id = settings.get("MONDAY_COMPANY_BOARD_ID")
+    token = settings.get("HUBSPOT_ACCESS_TOKEN")
 
     if not token:
-        raise RuntimeError("MONDAY_API_TOKEN is missing")
-    if not board_id:
-        raise RuntimeError("MONDAY_COMPANY_BOARD_ID is missing")
+        raise RuntimeError("HUBSPOT_ACCESS_TOKEN is missing")
 
-    url = "https://api.monday.com/v2"
     headers = {
-        "Authorization": token,
-        "Content-Type": "application/json",
-        "API-Version": "2023-10"
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
     }
 
-    column_values = {}
+    session = get_hubspot_session()
 
-    for key, value in item_data["columns"].items():
-        if value is None:
+    url = f"https://api.hubapi.com/crm/v3/objects/{object_type}/batch/upsert"
+
+    prepared_inputs = []
+
+    for item in items:
+        props = item.get("properties", {})
+        unique_value = props.get(id_property)
+
+        if not unique_value:
             continue
 
-        column_id = column_mapping.get(key)
+        prepared_inputs.append({
+            "id": unique_value,
+            "idProperty": id_property,
+            "properties": props
+        })
 
-        if not column_id:
-            raise ValueError(f"Column mapping missing for key: {key}")
+    payload = {
+        "inputs": prepared_inputs
+    }
 
-        else:
-            column_values[column_id] = value
+    response = session.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=30
+    )
 
-    column_values = {k: v for k, v in column_values.items() if v is not None}
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"HubSpot Batch Upsert Error: {e}. Details: {response.text}")
+    
+    response_json = response.json()
+    if response.status_code == 207 and "errors" in response_json:
+        print(f"⚠️ WARNING: Partial Batch Failure. {len(response_json['errors'])} items failed.")
+        print(f"Error Details: {response_json['errors']}")
+    return response_json
 
-
-    session = requests.session()
-
-    final_response = session.post(url, 
-                                   headers=headers, 
-                                   json=, 
-                                   timeout=30)
-    final_response.raise_for_status()
-    result = final_response.json()
-
-    if "errors" in result:
-        raise RuntimeError(f"Monday Mutation Error: {result['errors']}")
-
-    return result
