@@ -1,64 +1,57 @@
 from config.settings import load_settings
-from clients.hubspot_client import fetch_object
-from transformers.company_mapper import transform_company
-from clients.monday_client import upsert_item
+from clients.mailchimp_client import fetch_object
+from transformers.contact_mapping import transform_contact_mailchimp
+from clients.hubspot_client import batch_upsert_items
 from state.checkpoint import load_checkpoint, save_checkpoint
-from config.monday_columns import monday_company_columns
-from config.hubspot_columns import hubspot_properties
+from config.mailchimp_columns import mailchimp_properties
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-def process_record(hubspot_record, settings):
-    mapped = transform_company(hubspot_record)
-
-    upsert_item(
-        board_id=settings["MONDAY_COMPANY_BOARD_ID"],
-        unique_column_id=monday_company_columns["hubspot_id"],
-        column_mapping=monday_company_columns,
-        item_data=mapped
-    )
 
 def run_migration():
     settings = load_settings()
 
-    after = load_checkpoint() or None
+    offset = load_checkpoint() or 0
 
     total_processed = 0
 
     migration_start = time.time()
 
-    print(f"Starting migration from cursor: {after}")
+    print(f"Starting migration from offset: {offset}")
 
     while True:
-        hubspot_records, next_after = fetch_object(
-            object_type="companies",
-            properties=hubspot_properties,
-            after=after,
-            limit=settings["HUBSPOT_PAGE_LIMIT"]
+        mailchimp_records, next_offset = fetch_object(
+            list_id=settings["Mailchimp_Audience_ID"],
+            fields=mailchimp_properties,
+            offset=offset,
+            limit=settings["Mailchimp_PAGE_LIMIT"]
         )
 
-        if not hubspot_records:
-            print("No more companies to process.")
+        if not mailchimp_records:
+            print("No more contacts to process.")
             break
 
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            futures = executor.map(
-                lambda record: process_record(record, settings),
-                hubspot_records
-            )
-            list(futures)
+        transformed = [
+            transform_contact_mailchimp(record)
+            for record in mailchimp_records
+        ]
 
-        total_processed += len(hubspot_records)
+        batch_upsert_items(
+            object_type="contacts",
+            items=transformed,
+            id_property="email"
+        )
 
-        save_checkpoint(next_after)
+        total_processed += len(transformed)
 
-        print(f"Processed batch of {len(hubspot_records)}. Next cursor: {next_after}")
+        save_checkpoint(next_offset)
 
-        if not next_after:
-            print("Reached end of HubSpot data.")
+        print(f"Processed batch of {len(transformed)}. Next offset: {next_offset}")
+
+        if not next_offset:
+            print("Reached end of Mailchimp data.")
             break
 
-        after = next_after
+        offset = next_offset
 
     migration_end = time.time()
 
@@ -67,6 +60,7 @@ def run_migration():
     print(f"Total time: {migration_end - migration_start:.2f} seconds")
     print(f"Records per second: {total_processed / (migration_end - migration_start):.2f}")
     print("Migration completed successfully.")
+
 
 if __name__ == "__main__":
     run_migration()

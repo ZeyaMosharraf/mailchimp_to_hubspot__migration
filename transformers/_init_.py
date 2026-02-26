@@ -1,0 +1,1 @@
+from .contact_mapping import transform_contact_mailchimp

@@ -10,8 +10,7 @@ def _parse_date(raw: str | None) -> str | None:
     except Exception:
         return None
 
-
-def transform_mailchimp(member: dict) -> dict | None:
+def transform_contact_mailchimp(member: dict) -> dict | None:
 
     email = member.get("email_address")
 
