@@ -1,4 +1,4 @@
-# Mailchimp → HubSpot Migration | Digital Marketing Agency
+# Mailchimp → HubSpot Migration
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
 ![Status](https://img.shields.io/badge/Status-Production--Ready-brightgreen)
 ![APIs](https://img.shields.io/badge/APIs-Mailchimp%20%7C%20HubSpot-orange)
