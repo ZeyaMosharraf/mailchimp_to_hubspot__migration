@@ -1,269 +1,214 @@
-# Mailchimp → HubSpot Migration
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Production--Ready-brightgreen)
-![APIs](https://img.shields.io/badge/APIs-Mailchimp%20%7C%20HubSpot-orange)
-
-
----
+# Mailchimp → HubSpot Reliability-Engineered Migration Platform
 
 ## Executive Summary
 
-| | |
+This repository implements a **resumable CRM migration framework** for moving contact data from Mailchimp to HubSpot with operational safety controls.  
+The pipeline is designed for **correctness, deterministic recovery, and migration reliability** under real API failure conditions, not maximum theoretical throughput.
+
+| Dimension | Design Position |
 |---|---|
-| **Business Problem** | Client needed to fully shut down Mailchimp and move all contact data into HubSpot CRM without manual effort or data loss |
-| **Solution** | Automated Python pipeline that extracts contacts from Mailchimp via paginated API calls, transforms field mappings, and batch-upserts directly into HubSpot |
-| **Throughput** | ~16.95 records/second |
-| **Key Impact** | Full contact base migrated with tags, segmentation, and field mappings preserved — zero manual exports required |
-
-**Next Steps:**
-1. Extend transformer to support custom properties and additional Mailchimp merge fields per client
-2. Add a validation report post-migration to diff Mailchimp source vs HubSpot destination counts
-3. Package as a reusable CLI tool configurable via a single `config.yaml` for new client onboarding
-
----
+| Primary objective | Safe, repeatable migration execution |
+| Execution model | Synchronous, checkpointed batch orchestration |
+| Reliability model | Retry/backoff + persistent offset state + idempotent upsert |
+| Recovery model | Restart from last committed offset |
 
 ## Business Problem
 
-The client decided to fully decommission Mailchimp and consolidate their marketing operations into HubSpot as their single platform. A native Mailchimp → HubSpot migration path does not exist — HubSpot provides no built-in connector to import directly from Mailchimp with field mapping, tag preservation, or batch control.
+Cross-platform CRM migrations are operationally risky: API rate limits, transient failures, and long-running jobs create restart and duplication risk.  
+This platform addresses those failure modes with controlled pagination, batch upsert semantics, and persistent checkpointing.
 
-Without this tool:
-- Contact data, tags, and segmentation would have been lost or required slow, error-prone manual CSV exports
-- There was no way to resume a failed migration mid-way without reprocessing from the beginning
-- Scale would have been a blocker — manual imports have no retry logic or rate-limit handling
+## Why This System Exists
 
-**Type:** One-time migration  
-**Scope:** Part of a full platform switch from Mailchimp to HubSpot
+- Eliminate manual export/import dependency for large contact migrations.
+- Preserve core contact attributes during platform cutover.
+- Support deterministic restart after interruption without full reprocessing.
+- Provide an operational migration backbone that can be reused across engagements.
 
----
+## Key Engineering Highlights
 
-## Solution & Methodology
+- Isolated source and sink clients (`clients/`) with retry-enabled HTTP sessions.
+- Explicit transformation boundary (`transformers/`) for schema mapping control.
+- Offset checkpoint persistence (`state/checkpoint.json`) for resumability.
+- Batch upsert into HubSpot using identity property semantics.
+- API-aware retry strategy for 429 and 5xx transient failures.
+- Centralized operational logging for run visibility.
 
-A modular Python pipeline built across clearly separated layers — ingestion, transformation, and loading — with production-grade reliability features.
+## Architecture Overview
 
-**APIs Used:**
-- Mailchimp Marketing REST API — contact extraction with offset-based pagination
-- HubSpot Contacts Batch REST API — bulk upsert (create or update) by email
+```mermaid
+flowchart LR
+    A[Mailchimp API] --> B[Mailchimp Client]
+    B --> C[Orchestrator: main.py]
+    C --> D[Transformer Layer]
+    D --> E[HubSpot Client]
+    E --> F[HubSpot API]
+    C --> G[Checkpoint Store: state/checkpoint.json]
+    B --> H[Retry/Backoff Session]
+    E --> I[Retry/Backoff Session]
+```
 
-**Authentication:**
-- Mailchimp: API Key via `.env`
-- HubSpot: Private App Access Token via `.env`
+## Migration Workflow
 
-**Key Engineering Features:**
+1. Load runtime settings and last checkpoint offset.
+2. Fetch Mailchimp members page by page using bounded offset pagination.
+3. Transform each source record into HubSpot property payloads.
+4. Batch upsert transformed records to HubSpot by `email`.
+5. Persist next offset checkpoint after each successful batch.
+6. Continue until no further records are available.
 
-| Feature | Implementation |
+## System Design Decisions
+
+| Decision | Rationale |
 |---|---|
-| Pagination | Offset-based page fetching from Mailchimp to handle any audience size |
-| Checkpoint / Resume | Offset saved to `state/checkpoint.json` after every batch — safe to stop and restart |
-| Retry Logic | `urllib3` `HTTPAdapter` with automatic retries on transient failures for both APIs |
-| Field Transformation | Dedicated transformer layer maps Mailchimp merge fields to HubSpot property schema |
-| Batch Processing | 100 contacts per HubSpot API call — maximises throughput within API rate limits |
-| Structured Logging | Centralised logger across all modules for clean, traceable run output |
+| Offset checkpointing | Enables deterministic restart boundaries for long-running jobs |
+| Batch upsert | Reduces API write overhead and supports idempotent update/create behavior |
+| Client isolation | Keeps API transport concerns decoupled from orchestration logic |
+| Synchronous control loop | Prioritizes predictability and operational simplicity |
+| File-based state | Lightweight persistence for single-runner reliability |
 
----
+## Reliability Engineering
+
+- HTTP sessions use retry adapters for transient API failures.
+- Retry status classes include **429, 500, 502, 503, 504**.
+- Timeouts are explicitly set for outbound API calls.
+- Partial HubSpot batch failures are surfaced through logged warnings.
+- Invalid records missing required identity fields are skipped safely.
+
+## Checkpoint Recovery
+
+- Checkpoint file stores the next offset to process.
+- On restart, migration resumes from persisted offset.
+- Checkpoint commit occurs after each processed batch.
+- Restarting avoids full replay and limits duplicate processing risk.
+
+## Retry & Backoff Strategy
+
+| Client | Retry profile |
+|---|---|
+| Mailchimp client | Retry-enabled GET session; transient failure recovery |
+| HubSpot client | Retry-enabled POST/PATCH session; transient sink recovery |
+
+Backoff is configured to absorb temporary platform-side instability and rate-pressure events.
+
+## Batch Processing Strategy
+
+- Source extraction uses offset + limit pagination.
+- Sink writes use HubSpot batch endpoint for grouped upserts.
+- Batch-oriented flow balances API safety and migration progress.
+
+## Idempotent Upsert Logic
+
+- HubSpot writes are keyed by an identity property (`email`).
+- Existing contacts are updated; missing contacts are created.
+- Replayed batches remain operationally safe under restart scenarios.
+
+## Scalability Considerations
+
+- Current design scales linearly for single-runner workloads.
+- Memory remains bounded by batch/page size, not total dataset size.
+- Future scale path: partitioned workers + distributed checkpoint metadata.
+
+## Tradeoffs & Constraints
+
+- Synchronous execution limits peak throughput.
+- File checkpointing is not multi-worker safe.
+- Offset-level recovery can replay part of a boundary batch in edge scenarios.
+- Design intentionally favors reliability and operational clarity over concurrency.
+
+## Performance Optimization
+
+- Persistent HTTP session reuse reduces connection overhead.
+- Batch upsert reduces sink API call amplification.
+- Tunable page limit allows environment-specific latency/throughput balancing.
+
+## Security Considerations
+
+- API credentials are loaded from environment variables.
+- Secrets are excluded from version control via `.gitignore`.
+- No hardcoded tokens in source.
+- Runtime state files are environment-scoped.
 
 ## Project Structure
 
-```
-mailchimp_to_hubspot_migration/
-├── main.py                        # Entry point — orchestrates the full migration
-├── requirements.txt               # Python dependencies
-├── .env                           # API credentials (excluded from version control)
-│
+```text
+mailchimp_to_hubspot__migration/
+├── main.py
 ├── clients/
-│   ├── mailchimp_client.py        # Paginated contact extraction from Mailchimp
-│   └── hubspot_client.py          # Batch upsert of contacts into HubSpot
-│
+│   ├── mailchimp_client.py
+│   └── hubspot_client.py
 ├── transformers/
-│   └── contact_mapping.py         # Maps Mailchimp fields → HubSpot property schema
-│
-├── config/
-│   ├── settings.py                # Environment variable loader
-│   ├── mailchimp_columns.py       # Mailchimp fields to extract
-│   └── hubspot_columns.py         # HubSpot target property names
-│
+│   └── contact_mapping.py
 ├── state/
-│   ├── checkpoint.py              # Read/write migration offset to disk
-│   └── checkpoint.json            # Auto-generated; tracks last processed offset
-│
+│   ├── checkpoint.py
+│   └── checkpoint.json
+├── config/
+│   ├── settings.py
+│   ├── mailchimp_columns.py
+│   └── hubspot_columns.py
+├── utils/
+│   └── logger.py
 ├── tests/
-│   ├── test_mailchimp_client.py   # Unit tests — Mailchimp extraction
-│   ├── test_hubspot_client.py     # Unit tests — HubSpot batch upsert
-│   └── test_main.py               # Integration tests — full migration flow
-│
-└── utils/
-    └── logger.py                  # Shared logger instance
+└── docs/
 ```
 
----
-
-## Setup
-
-### 1. Install dependencies
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Create `.env` file
+## Environment Setup
+
+Create `.env`:
 
 ```env
 HUBSPOT_ACCESS_TOKEN=your_hubspot_private_app_token
 Mailchimp_API_TOKEN=your_mailchimp_api_key
-Mailchimp_Audience_ID=your_mailchimp_list_id
+Mailchimp_Audience_ID=your_mailchimp_audience_id
 Mailchimp_PAGE_LIMIT=100
 ```
 
-> **Where to find these:**
-> - HubSpot token: Settings → Integrations → Private Apps
-> - Mailchimp API key: Account → Extras → API Keys
-> - Mailchimp Audience ID: Audience → Settings → Audience name and defaults
-
----
-
-## Running the Migration
+## Usage Instructions
 
 ```bash
 python main.py
 ```
 
-**Example output:**
-```
+## Example Migration Flow
+
+```text
 Starting migration from offset: 0
 Processed batch of 100. Next offset: 100
 Processed batch of 100. Next offset: 200
 ...
 ===== MIGRATION SUMMARY =====
 Total processed: <n>
-Total time: <t> seconds
-Records per second: ~16.95
+Total time: <seconds>
+Records per second: <value>
 Migration completed successfully.
 ```
 
-> Throughput scales linearly. Each batch of 100 contacts completes in approximately 5–6 seconds depending on network latency. No hardcoded record limits — the pipeline runs until the full audience is exhausted.
+## Logging & Recovery
 
----
+- Runtime output includes batch progression and summary metrics.
+- Failed runs can be restarted without manual offset recalculation.
+- Clear checkpoint state allows deterministic operational recovery.
 
-## Resume After Failure
+## Future Evolution Roadmap
 
-Progress is saved to `state/checkpoint.json` after every batch. If the migration is interrupted for any reason, simply re-run:
+1. Orchestrator integration (Airflow/Prefect) for scheduled managed runs.
+2. Distributed checkpoint metadata store for multi-worker execution.
+3. Async/queue-backed worker model with DLQ for non-retriable records.
+4. Structured observability (metrics, tracing, alerting) for SLO governance.
+5. Schema-contract validation and migration reconciliation reporting.
 
-```bash
-python main.py
-```
+## Documentation Links
 
-It resumes from the last saved offset automatically — no duplicate processing.
+- [Architecture](docs/architecture.md)
+- [Checkpoint Recovery](docs/checkpoint-recovery.md)
+- [Reliability Engineering](docs/reliability-engineering.md)
+- [Engineering Decisions](docs/engineering-decisions.md)
+- [Scalability](docs/scalability.md)
+- [Engineering Case Study](docs/case-study.md)
+- [Diagrams](diagrams/)
 
-**To restart from scratch:**
-```bash
-# macOS / Linux
-rm state/checkpoint.json
-
-# Windows
-del state\checkpoint.json
-```
-
----
-
-## Field Mapping
-
-| Mailchimp Field | HubSpot Property | Notes |
-|---|---|---|
-| `email_address` | `email` | Primary key for upsert |
-| `merge_fields.FNAME` | `firstname` | |
-| `merge_fields.LNAME` | `lastname` | |
-| `merge_fields.PHONE` | `phone` | |
-| `merge_fields.ADDRESS.city` | `city` | |
-| `merge_fields.ADDRESS.state` | `state` | |
-| `merge_fields.ADDRESS.zip` | `zip` | |
-| `tags[].name` | `tags` | Joined as semicolon-separated string |
-
-> To extend mappings for a new client, update `config/mailchimp_columns.py`, `config/hubspot_columns.py`, and `transformers/contact_mapping.py`.
-
----
-
-## Testing
-
-```bash
-# Run all tests
-python -m pytest tests/
-
-# Run a specific module
-python -m pytest tests/test_mailchimp_client.py
-```
-
----
-
-## Seeding Test Data (Development Only)
-
-```bash
-python scripts/seed_mailchimp.py
-```
-
-> ⚠️ Adjust `TOTAL_RECORDS` in the script to stay within your Mailchimp plan's contact limits.
-
----
-
-## Results & Business Impact
-
-| Metric | Result |
-|---|---|
-| **Throughput** | ~16.95 records/second |
-| **Batch efficiency** | 100 contacts per API call |
-| **Failure recovery** | Automatic resume from last checkpoint — no data reprocessing |
-| **Data integrity** | Tags, field mappings, and segmentation data fully preserved |
-| **Manual effort eliminated** | Zero CSV exports or manual field mapping required |
-
-**Who benefits:**
-- **Client** — complete, clean contact base available in HubSpot from day one, with no data loss
-- **Implementation team** — reusable pipeline template adaptable for future Mailchimp → HubSpot migrations with minimal reconfiguration
-
----
-
-## Future Reusability
-
-This codebase is structured as a reusable migration template. Potential extensions for future client engagements:
-
-1. **Config-driven onboarding** — Replace hardcoded column files with a single `config.yaml` so a new client migration requires only a config change, not code changes
-2. **Extended field support** — Add support for custom Mailchimp merge fields and HubSpot custom properties to cover non-standard client schemas
-3. **Post-migration validation report** — Auto-generate a diff report comparing Mailchimp source count vs HubSpot destination count per batch to confirm data integrity
-4. **Multi-audience support** — Loop over multiple Mailchimp audience IDs in one run for clients with segmented lists
-5. **Other CRM targets** — Swap the HubSpot client layer for a Salesforce or ActiveCampaign client to reuse the same extraction and transformation logic
-
----
-
-## Security & Version Control
-
-The following are excluded from version control via `.gitignore`:
-
-| Path | Reason |
-|---|---|
-| `.env` | Contains API credentials — never commit |
-| `tests/` | Internal test suite — not part of the production deployment |
-| `state/checkpoint.json` | Auto-generated at runtime — environment specific |
-| `__pycache__/` | Python bytecode — auto-generated |
-
-> All API credentials are loaded via `python-dotenv` at runtime only and never hardcoded in source files.
-
----
-
-## Skills & Technologies
-
-| Category | Tools / Concepts |
-|---|---|
-| **Language** | Python 3.8+ |
-| **APIs** | Mailchimp Marketing REST API, HubSpot Contacts Batch REST API |
-| **Authentication** | API Key, Private App Bearer Token |
-| **Engineering Patterns** | Pagination, Checkpoint/Resume, Retry Logic, Batch Processing, ETL Pipeline |
-| **Libraries** | `requests`, `urllib3`, `python-dotenv` |
-| **Testing** | `pytest` — unit + integration |
-| **Dev Tools** | `.env` config, `.gitignore`, structured logging |
-
----
-
-## Dependencies
-
-| Package | Version | Purpose |
-|---|---|---|
-| `requests` | 2.32.5 | HTTP calls to Mailchimp & HubSpot APIs |
-| `urllib3` | 2.6.3 | Retry logic via `HTTPAdapter` |
-| `python-dotenv` | 1.2.1 | Load API credentials from `.env` |
